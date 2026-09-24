@@ -37,3 +37,10 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### H2 local data ###
+data/
+*.mv.db
+*.trace.db
+
+### local run logs ###
+runlogs/
