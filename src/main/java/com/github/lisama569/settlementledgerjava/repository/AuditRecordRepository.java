@@ -3,9 +3,11 @@ package com.github.lisama569.settlementledgerjava.repository;
 import com.github.lisama569.settlementledgerjava.domain.AuditRecord;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
 import java.util.List;
 
 public interface AuditRecordRepository extends JpaRepository<AuditRecord, Long> {
@@ -18,4 +20,9 @@ public interface AuditRecordRepository extends JpaRepository<AuditRecord, Long> 
      */
     @Query("select a from AuditRecord a where (:cursor is null or a.id > :cursor) order by a.id asc")
     List<AuditRecord> findPageAfter(@Param("cursor") Long cursor, Pageable pageable);
+
+    /** 归档搬移后从热表删除（与归档插入在同一事务内，失败整体回滚）。 */
+    @Modifying
+    @Query("delete from AuditRecord a where a.id in :ids")
+    int deleteByIdIn(@Param("ids") Collection<Long> ids);
 }

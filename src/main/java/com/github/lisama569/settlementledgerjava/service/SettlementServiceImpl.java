@@ -2,6 +2,7 @@ package com.github.lisama569.settlementledgerjava.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.github.lisama569.settlementledgerjava.audit.AuditHistoryReader;
 import com.github.lisama569.settlementledgerjava.audit.AuditPayloadUpcaster;
 import com.github.lisama569.settlementledgerjava.domain.AuditRecord;
 import com.github.lisama569.settlementledgerjava.domain.SettlementInstruction;
@@ -42,14 +43,17 @@ public class SettlementServiceImpl implements SettlementService {
 
     private final SettlementInstructionRepository instructionRepository;
     private final AuditRecordRepository auditRecordRepository;
+    private final AuditHistoryReader historyReader;
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public SettlementServiceImpl(SettlementInstructionRepository instructionRepository,
                                  AuditRecordRepository auditRecordRepository,
+                                 AuditHistoryReader historyReader,
                                  TransactionTemplate transactionTemplate) {
         this.instructionRepository = instructionRepository;
         this.auditRecordRepository = auditRecordRepository;
+        this.historyReader = historyReader;
         this.transactionTemplate = transactionTemplate;
     }
 
@@ -128,8 +132,7 @@ public class SettlementServiceImpl implements SettlementService {
         instruction.transitionTo(target, now);
         instruction = instructionRepository.saveAndFlush(instruction);
 
-        long nextSeq = auditRecordRepository.findByInstructionIdOrderBySeqAsc(instructionId).stream()
-                .mapToLong(AuditRecord::getSeq).max().orElse(0L) + 1;
+        long nextSeq = historyReader.maxSeqOf(instructionId) + 1;
         ObjectNode payload = objectMapper.createObjectNode()
                 .put("idempotencyKey", instruction.getIdempotencyKey())
                 .put("fromStatus", from.name())
