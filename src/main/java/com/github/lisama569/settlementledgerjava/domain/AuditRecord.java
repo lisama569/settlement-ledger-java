@@ -1,5 +1,6 @@
 package com.github.lisama569.settlementledgerjava.domain;
 
+import com.github.lisama569.settlementledgerjava.audit.AuditEventView;
 import jakarta.persistence.*;
 import java.time.Instant;
 
@@ -10,7 +11,7 @@ import java.time.Instant;
 @Entity
 @Table(name = "audit_record",
         indexes = @Index(name = "idx_audit_instruction", columnList = "instruction_id, seq"))
-public class AuditRecord {
+public class AuditRecord implements AuditEventView {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

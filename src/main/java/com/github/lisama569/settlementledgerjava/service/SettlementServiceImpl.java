@@ -2,6 +2,7 @@ package com.github.lisama569.settlementledgerjava.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.github.lisama569.settlementledgerjava.audit.AuditHistoryReader;
 import com.github.lisama569.settlementledgerjava.audit.AuditPayloadUpcaster;
 import com.github.lisama569.settlementledgerjava.domain.AuditRecord;
 import com.github.lisama569.settlementledgerjava.domain.SettlementInstruction;
@@ -42,14 +43,17 @@ public class SettlementServiceImpl implements SettlementService {
 
     private final SettlementInstructionRepository instructionRepository;
     private final AuditRecordRepository auditRecordRepository;
+    private final AuditHistoryReader auditHistoryReader;
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public SettlementServiceImpl(SettlementInstructionRepository instructionRepository,
                                  AuditRecordRepository auditRecordRepository,
+                                 AuditHistoryReader auditHistoryReader,
                                  TransactionTemplate transactionTemplate) {
         this.instructionRepository = instructionRepository;
         this.auditRecordRepository = auditRecordRepository;
+        this.auditHistoryReader = auditHistoryReader;
         this.transactionTemplate = transactionTemplate;
     }
 
@@ -85,7 +89,8 @@ public class SettlementServiceImpl implements SettlementService {
                 .put("currency", command.currency())
                 .put("payer", command.payer())
                 .put("payee", command.payee())
-                .put("channel", "API");
+                .put("channel", "API")
+                .put("businessType", "PAYMENT");
         AuditRecord audit = new AuditRecord(instruction.getId(), 1L, null, SettlementStatus.RECEIVED,
                 "SUBMITTED", AuditPayloadUpcaster.CURRENT_SCHEMA_VERSION, payload.toString(), now);
         auditRecordRepository.save(audit);
@@ -128,14 +133,14 @@ public class SettlementServiceImpl implements SettlementService {
         instruction.transitionTo(target, now);
         instruction = instructionRepository.saveAndFlush(instruction);
 
-        long nextSeq = auditRecordRepository.findByInstructionIdOrderBySeqAsc(instructionId).stream()
-                .mapToLong(AuditRecord::getSeq).max().orElse(0L) + 1;
+        long nextSeq = auditHistoryReader.nextSeq(instructionId);
         ObjectNode payload = objectMapper.createObjectNode()
                 .put("idempotencyKey", instruction.getIdempotencyKey())
                 .put("fromStatus", from.name())
                 .put("toStatus", target.name())
                 .put("version", instruction.getVersion())
-                .put("channel", "API");
+                .put("channel", "API")
+                .put("businessType", "PAYMENT");
         AuditRecord audit = new AuditRecord(instructionId, nextSeq, from, target,
                 "STATUS_CHANGED", AuditPayloadUpcaster.CURRENT_SCHEMA_VERSION, payload.toString(), now);
         auditRecordRepository.save(audit);
