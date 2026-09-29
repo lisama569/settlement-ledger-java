@@ -37,3 +37,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### Local file-based H2 database (runtime data) ###
+data/
+logs/

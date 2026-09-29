@@ -1,7 +1,8 @@
 # settlement-ledger-java
 
-本地可验证的资金结算指令处理服务：Spring Boot 3 + 内嵌 H2 数据库，承载结算状态与审计记录，
-保证并发提交、重复提交、历史结构变更、对账快照重建/导出、历史归档与进程重启下的结果一致且可追溯。
+本地可验证的资金结算指令处理服务：Spring Boot 3 + 内嵌 H2 数据库（默认为文件型、提交即落盘），
+承载结算状态与审计记录，保证并发提交、重复提交、历史结构变更、对账快照重建/导出、历史归档以及
+**进程重启（含被直接杀进程）**下的结果一致、可追溯且不丢数据。
 
 ## 领域模型
 
@@ -87,14 +88,40 @@
 
 ## 进程重启持久性
 
-- 默认 profile 用内存 H2（`jdbc:h2:mem`），适合快速测试；重启不落盘。
-- 本地验证重启用 **local profile**（文件型 H2，`ddl-auto=update`，不做 drop）：
+- **默认就是持久化的**：`application.properties` 使用文件型 H2
+  （`jdbc:h2:file:./data/settlement;AUTO_SERVER=TRUE;WRITE_DELAY=0`）+ `ddl-auto=update`。
+  无论用哪种方式启动——直接 `mvn spring-boot:run`、`java -jar`，还是 IDE 运行 `Application`——
+  只要受理/推进/归档的接口已经成功返回，数据就已落盘。进程停掉（包括 `kill -9` / 直接杀进程、
+  机器断电这类**非优雅退出**）再起来，指令、完整审计历史、归档批次与归档表数据都还在：
+  - 按原标识查到的是同一条指令，状态/版本/时间戳/金额/收付方逐字段不变；
+  - 用同一幂等键重复受理，仍返回首次那条（`duplicate=true`），不会变成新指令；
+  - 可接着往下推进，新审计记录的 `seq` 接着合并历史（含已归档部分）继续递增，不回退、不撞号；
+  - 已归档历史重启后照常生效：合并重建/重放结果不变，同一 `runId` 不会再搬一遍
+    （`alreadyApplied=true`），热表与归档表不重不漏；
+  - 对同一段范围反复重建、批量导出，结果稳定一致、可复现。
+- **为什么硬杀也不丢已确认的写入**：
+  - 文件型 H2 的 MVStore 对每个已提交事务做日志；URL 上的 `WRITE_DELAY=0` 关闭“攒一批再刷盘”，
+    提交即 `fsync`，因此接口返回成功后即使 JVM 被 SIGKILL，数据也已在磁盘上；
+  - `ddl-auto=update` 只对已有库做增量结构更新，**绝不 drop**，重启不会清表；
+  - 受理/推进的“指令行 + 审计行”、归档的“插入归档表 + 删除热表行 + 推进批次游标”
+    都在同一事务内提交，原子可见，重启不会读到半条。
+- 数据文件位于启动工作目录下的 `./data/settlement.mv.db`（已在 `.gitignore` 忽略）。
+  `AUTO_SERVER=TRUE` 允许同机多个进程以服务器模式协商访问同一文件；正常单实例重启会直接接管。
+  需要一份全新的空库时，停服后删除 `./data` 目录再启动即可。
+- `local` profile（`application-local.properties`）与默认行为等价，保留给希望显式声明持久化的场景：
   ```bash
   mvn spring-boot:run -Dspring-boot.run.profiles=local
-  # 数据文件在 ./data/settlement.mv.db；Ctrl+C 后再次启动，之前的指令/历史/归档仍在
   ```
-- `RestartPersistenceTest` 用文件型 H2 + 两个独立 Spring 上下文模拟「进程退出 → 重启」，
-  断言重启后快照不变、可继续推进、幂等键仍生效、已归档历史仍参与重建。
+- 自动化测试如何模拟重启：
+  - `RestartPersistenceTest` 用文件型 H2 + 两个独立 Spring 上下文模拟“进程退出 → 重启”，
+    断言重启后快照逐字段不变、可继续推进、幂等键仍生效、已归档历史仍参与重建、
+    批量导出跨重启一致且可重复、重启后继续推进的 `seq` 正确衔接；
+  - `HardKillRestartTest` 更进一步：fork 两个**独立 JVM** 跑真实 Web 服务，第一段通过 HTTP
+    受理/推进/归档并确认成功后用 `Process.destroyForcibly()`（POSIX 下即 SIGKILL，退出码 137）
+    直接杀掉，不走任何优雅关闭；第二个全新 JVM 起同一份库文件，验证快照与导出逐字段一致、
+    幂等受理、归档不重复、可继续推进。
+- 仅测试运行时使用**内存库**（`src/test/resources/application.properties`），保证用例彼此隔离、
+  可重复执行；上述两个持久性用例通过命令行参数显式切到临时目录下的文件型 H2，不受该默认值影响。
 
 ## API 一览
 
@@ -111,16 +138,20 @@
 ## 本地验证
 
 ```bash
-# 运行全部测试（20 个）：并发 / 幂等 / 重放 / 分页 / 结构演进 /
-# 快照重建 / 批量导出 / 归档一致性 / 归档并发 / 归档断点续跑 / 重启持久性
+# 运行全部测试（24 个）：并发 / 幂等 / 重放 / 分页 / 结构演进 /
+# 快照重建 / 批量导出 / 归档一致性 / 归档并发 / 归档断点续跑 /
+# 重启持久性（上下文级 3 个用例 + 独立 JVM 硬杀）
 mvn test
 
-# 只跑本轮新增用例
-mvn -Dtest='SnapshotRebuildTest,SnapshotExportTest,ArchiveConsistencyTest,ArchiveConcurrencyTest,ArchiveRetryTest,RestartPersistenceTest' test
+# 只跑重启持久性相关用例
+mvn -Dtest='RestartPersistenceTest,HardKillRestartTest' test
 
-# 本地启动（默认内存库）
+# 本地启动：默认即为文件库，停掉再起来数据仍在（无需任何额外 profile）
 mvn spring-boot:run
-# 或文件库（重启数据仍在）
+# 或打 jar 后用平时的方式运行
+mvn package -DskipTests
+java -jar target/settlement-ledger-java-1.0-SNAPSHOT.jar
+# 想显式声明持久化也可以用 local profile（行为与默认一致）
 mvn spring-boot:run -Dspring-boot.run.profiles=local
 
 # 受理 -> 推进 -> 完整快照 -> 重放
@@ -140,6 +171,31 @@ curl -s -X POST 'localhost:8080/api/settlements/archives?runId=batch-1&cutoff=20
 curl -s localhost:8080/api/settlements/1/snapshot
 ```
 
+### 手动复现“受理/推进/归档 -> 停进程 -> 重启 -> 继续查询/推进/重建/导出”
+
+```bash
+mvn package -DskipTests
+# 1) 启动（默认文件库；如 8080 被占用可加 --server.port=18080）
+java -jar target/settlement-ledger-java-1.0-SNAPSHOT.jar
+# 2) 另开终端：受理、推进、归档，并各存一份快照/导出结果
+curl -s -X POST localhost:8080/api/settlements -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"restart-demo","amount":100.00,"currency":"CNY","payer":"alice","payee":"bob"}'
+curl -s -X POST 'localhost:8080/api/settlements/1/advance?expectedVersion=0&target=VALIDATED'
+curl -s localhost:8080/api/settlements/1/snapshot | tee before.json
+curl -s -X POST 'localhost:8080/api/settlements/archives?runId=batch-demo&cutoff=2030-01-01T00:00:00Z'
+# 3) 直接杀进程（模拟非正常退出；找到 jar 对应的 pid）
+jps -l | grep settlement-ledger-java | awk '{print $1}' | xargs -r kill -9
+# 4) 用完全相同的方式重新启动
+java -jar target/settlement-ledger-java-1.0-SNAPSHOT.jar
+# 5) 验证：快照逐字段一致、重复受理幂等、归档不重复、可继续推进
+diff <(cat before.json) <(curl -s localhost:8080/api/settlements/1/snapshot) && echo IDENTICAL
+curl -s -X POST localhost:8080/api/settlements -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"restart-demo","amount":1.00,"currency":"X","payer":"x","payee":"y"}'   # duplicate=true, id 仍为 1
+curl -s -X POST 'localhost:8080/api/settlements/archives?runId=batch-demo&cutoff=2030-01-01T00:00:00Z'  # alreadyApplied=true
+curl -s -X POST 'localhost:8080/api/settlements/1/advance?expectedVersion=1&target=SETTLED'  # version=2，seq 接续
+curl -s localhost:8080/api/settlements/1/replay
+```
+
 各场景与测试对应关系：
 
 | 场景 | 测试类 |
@@ -151,7 +207,9 @@ curl -s localhost:8080/api/settlements/1/snapshot
 | 归档前后快照与重放完全一致、归档后可继续推进 | `ArchiveConsistencyTest` |
 | 归档与受理/推进并发：不漏不重不误归档 | `ArchiveConcurrencyTest` |
 | 归档中途失败、同 runId 重试只生效一次 | `ArchiveRetryTest` |
-| 进程重启后历史（含归档）仍可用、可继续推进与重建 | `RestartPersistenceTest` |
+| 进程重启后历史（含归档）仍可用、导出跨重启一致、可继续推进与重建 | `RestartPersistenceTest` |
+| 归档进行期间并发的新受理/推进，重启后不丢不重、归档不重复 | `RestartPersistenceTest` |
+| 独立 JVM 被 SIGKILL 后重启：快照/导出逐字段一致、幂等、归档不重复 | `HardKillRestartTest` |
 | 既有并发/幂等/分页/重放不回归 | `ConcurrencyConflictTest` / `IdempotencyTest` / `AuditPaginationTest` / `ReplayConsistencyTest` |
 
 测试日志会打印幂等键、版本号与关键状态快照（`idempotencyKey=... status=... version=...`，
