@@ -85,16 +85,73 @@
   - 重建/重放统一走 `MergedAuditHistoryReader`（热表 + 归档表按 `seq` 合并），
     因此**归档前后重建快照完全一致**，归档后仍可继续推进（下一条 `seq` 基于合并历史计算，不回退）。
 
-## 进程重启持久性
+## 进程重启持久性（默认行为，任何启动方式都生效）
 
-- 默认 profile 用内存 H2（`jdbc:h2:mem`），适合快速测试；重启不落盘。
-- 本地验证重启用 **local profile**（文件型 H2，`ddl-auto=update`，不做 drop）：
-  ```bash
-  mvn spring-boot:run -Dspring-boot.run.profiles=local
-  # 数据文件在 ./data/settlement.mv.db；Ctrl+C 后再次启动，之前的指令/历史/归档仍在
-  ```
-- `RestartPersistenceTest` 用文件型 H2 + 两个独立 Spring 上下文模拟「进程退出 → 重启」，
-  断言重启后快照不变、可继续推进、幂等键仍生效、已归档历史仍参与重建。
+- **默认 profile 就是文件型 H2**（`jdbc:h2:file:./data/settlement`），
+  不管用 `mvn spring-boot:run`、`java -jar` 还是 IDE 直接启动，指令、审计历史、
+  归档表都落在 `./data/settlement.mv.db`；进程停掉再用同样方式起来，
+  按原 `idempotencyKey` / `instructionId` 查到的还是同一条，状态、版本、
+  完整审计链与重启前逐字段一致，可以接着推进，重复受理依然返回原结果（`duplicate=true`）。
+- **非正常退出也不丢已确认数据**：连接带 `WRITE_DELAY=0`，事务提交即 fsync 落盘，
+  因此 `kill -9`、掉电这种没走优雅退出的场景下，只要接口已经成功返回，
+  对应受理/推进结果重启后必然还在。另外带 `FILE_LOCK=NO`，
+  进程被强杀后不会因为遗留锁文件导致下次起不来（单进程本地服务，不依赖文件锁）。
+- **DDL 不做 drop**：`spring.jpa.hibernate.ddl-auto=update`，启动只增量建表，
+  不会清空已有数据。ID 自增序列也在文件里，重启后继续往后分配，不回头撞已有主键。
+- `local` profile（`mvn spring-boot:run -Dspring-boot.run.profiles=local`）
+  用同一个数据文件，额外开 `AUTO_SERVER=TRUE`（方便排查时另起一个 H2 工具进程同时打开文件），
+  并同样带 `WRITE_DELAY=0`。**不显式加 profile 时数据也一样持久。**
+- 归档状态跨重启：已完成的 `ArchiveRun` 与归档表记录都在文件里，
+  重启后用同一个 `runId` 再归档直接回放 `alreadyApplied=true`，不会重复搬；
+  已归档历史照常参与重建/重放/导出；重启后继续推进产生的审计记录
+  按热表+归档表合并历史的 `max(seq)+1` 接着编号，不回退、不冲突；
+  归档期间（cutoff 之后）新受理/推进的记录不在归档范围内，重启后同样不丢、不重。
+- 测试默认仍用**内存 H2**（见 `src/test/resources/application.properties`），
+  用例互不污染、跑得快；重启持久性由专门的用例用文件库验证（见下）。
+
+### 本地复现「受理/推进/归档 -> kill -9 -> 重启」全链路
+
+```bash
+# 1) 用平时的方式启动（不带任何 profile）
+mvn spring-boot:run
+
+# 2) 另一个终端：受理 -> 推进 -> 快照 -> 归档
+curl -s -X POST localhost:8080/api/settlements -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"demo-1","amount":100.00,"currency":"CNY","payer":"alice","payee":"bob"}'
+curl -s -X POST 'localhost:8080/api/settlements/1/advance?expectedVersion=0&target=VALIDATED'
+curl -s localhost:8080/api/settlements/1/snapshot        # 记下完整快照
+curl -s -X POST 'localhost:8080/api/settlements/archives?runId=batch-1&cutoff=2030-01-01T00:00:00Z'
+
+# 3) 直接 kill -9（jps 找到 com.github.lisama569...Application 的 pid），等价非正常退出
+jps -l
+kill -9 <应用JVM的pid>
+
+# 4) 用完全一样的命令重启
+mvn spring-boot:run
+
+# 5) 重启后逐项核对：快照逐字段不变、可继续推进、重复受理仍幂等、归档只生效一次
+curl -s localhost:8080/api/settlements/1/snapshot        # 与第 2 步结果一致
+curl -s -X POST 'localhost:8080/api/settlements/1/advance?expectedVersion=1&target=SETTLED'
+curl -s -X POST localhost:8080/api/settlements -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"demo-1","amount":100.00,"currency":"CNY","payer":"alice","payee":"bob"}'
+#  -> "duplicate":true，instructionId 仍是 1
+curl -s -X POST 'localhost:8080/api/settlements/archives?runId=batch-1&cutoff=2030-01-01T00:00:00Z'
+#  -> "alreadyApplied":true，archivedCount 不变
+```
+
+数据文件在项目根目录 `./data/settlement.mv.db`（已加入 `.gitignore`）；
+想从零开始，停服后删掉 `data/` 目录即可。
+
+### 自动化测试怎么覆盖重启
+
+- `RestartPersistenceTest`：文件型 H2 + 两个独立 Spring 上下文模拟「进程退出 -> 重启」，
+  断言重启后快照**逐字段**相等（含金额、币种、收付方、时间戳、attributes）、
+  反复重建与批量导出结果稳定一致、归档期间新受理/推进的记录不丢不重、
+  已完成归档重启后仍是 `alreadyApplied`、继续推进 seq 接原序号、
+  重复受理返回原指令；另有一个多轮重启用例验证可复现性。
+- `HardKillRestartTest`：拉起真正的 OS 子进程，受理+推进后调用 `Runtime.halt(0)`
+  （不执行任何 shutdown hook，等价 `kill -9`），再用第二个子进程和当前 JVM 新上下文
+  验证已提交数据仍在、重复受理幂等、可继续推进。
 
 ## API 一览
 
@@ -111,16 +168,17 @@
 ## 本地验证
 
 ```bash
-# 运行全部测试（20 个）：并发 / 幂等 / 重放 / 分页 / 结构演进 /
-# 快照重建 / 批量导出 / 归档一致性 / 归档并发 / 归档断点续跑 / 重启持久性
+# 运行全部测试（23 个）：并发 / 幂等 / 重放 / 分页 / 结构演进 /
+# 快照重建 / 批量导出 / 归档一致性 / 归档并发 / 归档断点续跑 /
+# 重启持久性（上下文重启 + 真正的 kill -9 子进程）
 mvn test
 
-# 只跑本轮新增用例
-mvn -Dtest='SnapshotRebuildTest,SnapshotExportTest,ArchiveConsistencyTest,ArchiveConcurrencyTest,ArchiveRetryTest,RestartPersistenceTest' test
+# 只跑持久性相关用例
+mvn -Dtest='RestartPersistenceTest,HardKillRestartTest' test
 
-# 本地启动（默认内存库）
+# 本地启动（默认即为文件库，重启数据仍在；无需额外 profile）
 mvn spring-boot:run
-# 或文件库（重启数据仍在）
+# 或显式 local profile（同一份数据文件，额外允许外部 H2 工具并发打开）
 mvn spring-boot:run -Dspring-boot.run.profiles=local
 
 # 受理 -> 推进 -> 完整快照 -> 重放
@@ -151,7 +209,8 @@ curl -s localhost:8080/api/settlements/1/snapshot
 | 归档前后快照与重放完全一致、归档后可继续推进 | `ArchiveConsistencyTest` |
 | 归档与受理/推进并发：不漏不重不误归档 | `ArchiveConcurrencyTest` |
 | 归档中途失败、同 runId 重试只生效一次 | `ArchiveRetryTest` |
-| 进程重启后历史（含归档）仍可用、可继续推进与重建 | `RestartPersistenceTest` |
+| 进程重启后历史（含归档）仍可用、快照逐字段不变、可继续推进与重建、导出稳定 | `RestartPersistenceTest` |
+| 进程被 kill -9（无优雅退出）后已确认数据不丢、重启仍幂等可推进 | `HardKillRestartTest` |
 | 既有并发/幂等/分页/重放不回归 | `ConcurrencyConflictTest` / `IdempotencyTest` / `AuditPaginationTest` / `ReplayConsistencyTest` |
 
 测试日志会打印幂等键、版本号与关键状态快照（`idempotencyKey=... status=... version=...`，

@@ -44,6 +44,16 @@
     <build>
         <plugins>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- 不用仅含 manifest 的 jar：让测试 JVM 的 java.class.path 就是完整
+                         classpath，HardKillRestartTest 才能以它为 -cp 拉起独立子进程 -->
+                    <manifestOnlyJar>false</manifestOnlyJar>
+                    <useSystemClassLoader>false</useSystemClassLoader>
+                </configuration>
+            </plugin>
+            <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
